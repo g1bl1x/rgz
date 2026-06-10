@@ -3,7 +3,12 @@
 
 #include <string>
 
-#define EXPORT_API extern "C"
+// Макросы для экспорта функций в динамическую библиотеку
+#if defined(_WIN32) || defined(_WIN64)
+    #define EXPORT_API extern "C" __declspec(dllexport)
+#else
+    #define EXPORT_API extern "C"
+#endif
 
 // Унифицированный интерфейс алгоритмов
 EXPORT_API void encrypt_text(const char* input, const char* key, char* output);
