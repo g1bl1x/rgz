@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC  -Wall -Wextra -Werror -shared -Wl,-soname,libvigenere.so -o libvigenere.so CMakeFiles/vigenere.dir/vigenere.cpp.o 

@@ -1,346 +1,340 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <stdexcept>
-#include <clocale>
+#include <fstream>
 #include <cstring>
-#include <filesystem>
+#include <getopt.h>
+#include <dlfcn.h>
+#include <random>
 #include <memory>
 #include <algorithm>
-#include <sstream>
-#include <iomanip>
 
-#if defined(_WIN32) || defined(_WIN64)
+#include "cipher_api.h"
+
+#ifdef _WIN32
     #include <windows.h>
-    typedef HMODULE LibHandle;
+    #define LIB_HANDLE HMODULE
     #define LOAD_LIB(path) LoadLibraryA(path)
     #define GET_FUNC GetProcAddress
     #define CLOSE_LIB FreeLibrary
-    const std::string LIB_EXT = ".dll";
 #else
-    #include <dlfcn.h>
-    typedef void* LibHandle;
+    #define LIB_HANDLE void*
     #define LOAD_LIB(path) dlopen(path, RTLD_LAZY)
     #define GET_FUNC dlsym
     #define CLOSE_LIB dlclose
-    const std::string LIB_EXT = ".so";
 #endif
 
-#include "CipherAPI.h" 
-
-using namespace std;
-namespace fs = filesystem;
-
-// Структура для хранения информации о загруженной библиотеке
-struct CryptoLib {
-    string name;
-    LibHandle handle;
-    TextFunc encrypt_text;
-    TextFunc decrypt_text;
-    FileFunc encrypt_file;
-    FileFunc decrypt_file;
-    KeyGenFunc generate_key;
-
-    CryptoLib() : handle(nullptr), encrypt_text(nullptr), decrypt_text(nullptr),
-                  encrypt_file(nullptr), decrypt_file(nullptr), generate_key(nullptr) {}
+// Соответствие алгоритмов именам библиотек
+struct AlgorithmEntry {
+    const char* name;
+    const char* lib_name_linux;
+    const char* lib_name_windows;
 };
 
-string bytes_to_hex(const char* data, size_t len) {
-    stringstream ss;
-    for (size_t i = 0; i < len; ++i) {
-        ss << hex << setw(2) << setfill('0') << (int)(unsigned char)data[i];
-    }
-    return ss.str();
+static const AlgorithmEntry algorithms[] = {
+    {"vigenere", "libvigenere.so", "vigenere.dll"},
+    {"des",      "libdes.so",      "des.dll"},
+    {"shamir",   "libshamir.so",   "shamir.dll"},
+    {nullptr, nullptr, nullptr}
+};
+
+// Глобальные опции командной строки
+struct Options {
+    bool help = false;
+    std::string algorithm;
+    std::string mode;           // "encrypt", "decrypt", "generate-key"
+    std::string key_path;       // --key <file>
+    bool generate_key = false;  // --generate-key
+    std::string save_key_path;  // --save-key <file>
+    bool write_key = false;     // --write-key
+    std::string input_path;     // --input <file>
+    std::string output_path;    // --output <file>
+};
+
+static void print_help(const char* prog_name) {
+    std::cout << "Usage: " << prog_name << " [OPTIONS]\n\n"
+              << "Encryption/Decryption tool with pluggable crypto algorithms.\n\n"
+              << "Options:\n"
+              << "  -h, --help                  Show this help message\n"
+              << "  -a, --algorithm ALGO        Select algorithm (vigenere, des, shamir)\n"
+              << "  -m, --mode MODE             Mode: encrypt, decrypt, generate-key\n"
+              << "  -k, --key FILE              Read key from FILE\n"
+              << "  -g, --generate-key          Generate new key\n"
+              << "  -s, --save-key FILE         Save generated key to FILE\n"
+              << "  -w, --write-key             Write key to stdout\n"
+              << "  -i, --input FILE            Read input from FILE (default: stdin)\n"
+              << "  -o, --output FILE           Write output to FILE (default: stdout)\n\n"
+              << "Examples:\n"
+              << "  " << prog_name << " --help\n"
+              << "  " << prog_name << " -a vigenere -m generate-key -s key.bin\n"
+              << "  " << prog_name << " -a des -m encrypt -k key.bin -i data.txt -o data.enc\n"
+              << "  " << prog_name << " -a shamir -m decrypt -k key.bin -i data.enc\n"
+              << "  cat data.txt | " << prog_name << " -a vigenere -m encrypt -g -w\n";
 }
 
-// Преобразование hex-строки в байты
-vector<unsigned char> hex_to_bytes(const string& hex) {
-    vector<unsigned char> bytes;
-    if (hex.length() % 2 != 0) {
-        throw invalid_argument("Hex строка должна иметь чётную длину");
-    }
-    for (size_t i = 0; i < hex.length(); i += 2) {
-        string byte_str = hex.substr(i, 2);
-        char* endptr;
-        long val = strtol(byte_str.c_str(), &endptr, 16);
-        if (*endptr != 0) {
-            throw invalid_argument("Неверный hex символ");
-        }
-        bytes.push_back((unsigned char)val);
-    }
-    return bytes;
-}
-
-// Удаление библиотеки при выходе из области видимости
-void close_lib(CryptoLib& lib) {
-    if (lib.handle) {
-        CLOSE_LIB(lib.handle);
-        lib.handle = nullptr;
-    }
-}
-
-// Поиск библиотек в текущей папке
-vector<string> find_libraries() {
-    vector<string> paths;
-    fs::path search_dir = "."; 
-    if (!fs::exists(search_dir)) search_dir = ".";
+static Options parse_args(int argc, char* argv[]) {
+    Options opts;
     
-    for (auto& entry : fs::directory_iterator(search_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == LIB_EXT) {
-            paths.push_back(entry.path().string());
+    static struct option long_options[] = {
+        {"help",         no_argument,       0, 'h'},
+        {"algorithm",    required_argument, 0, 'a'},
+        {"mode",         required_argument, 0, 'm'},
+        {"key",          required_argument, 0, 'k'},
+        {"generate-key", no_argument,       0, 'g'},
+        {"save-key",     required_argument, 0, 's'},
+        {"write-key",    no_argument,       0, 'w'},
+        {"input",        required_argument, 0, 'i'},
+        {"output",       required_argument, 0, 'o'},
+        {0, 0, 0, 0}
+    };
+    
+    int opt;
+    while ((opt = getopt_long(argc, argv, "ha:m:k:gs:wi:o:", long_options, nullptr)) != -1) {
+        switch (opt) {
+            case 'h': opts.help = true; break;
+            case 'a': opts.algorithm = optarg; break;
+            case 'm': opts.mode = optarg; break;
+            case 'k': opts.key_path = optarg; break;
+            case 'g': opts.generate_key = true; break;
+            case 's': opts.save_key_path = optarg; break;
+            case 'w': opts.write_key = true; break;
+            case 'i': opts.input_path = optarg; break;
+            case 'o': opts.output_path = optarg; break;
+            default: break;
         }
     }
-    return paths;
+    
+    return opts;
 }
 
-// Загрузка конкретной библиотеки и получение указателей на функции
-bool load_library(const string& path, CryptoLib& lib) {
-    lib.handle = LOAD_LIB(path.c_str());
+// Чтение всего содержимого файла
+static std::vector<uint8_t> read_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + path);
+    }
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(file)),
+                                  std::istreambuf_iterator<char>());
+}
+
+// Запись в файл
+static void write_file(const std::string& path, const uint8_t* data, size_t size) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot write to file: " + path);
+    }
+    file.write(reinterpret_cast<const char*>(data), size);
+}
+
+// Чтение из stdin
+static std::vector<uint8_t> read_stdin() {
+    std::vector<uint8_t> buffer;
+    char ch;
+    while (std::cin.get(ch)) {
+        buffer.push_back(static_cast<uint8_t>(ch));
+    }
+    return buffer;
+}
+
+// Запись в stdout
+static void write_stdout(const uint8_t* data, size_t size) {
+    std::cout.write(reinterpret_cast<const char*>(data), size);
+}
+
+// Очистка чувствительных данных (защита от утечек)
+static void secure_zero(void* ptr, size_t size) {
+    volatile uint8_t* p = static_cast<volatile uint8_t*>(ptr);
+    for (size_t i = 0; i < size; ++i) {
+        p[i] = 0;
+    }
+}
+
+// Генерация случайного ключа
+static std::vector<uint8_t> generate_random_key(size_t key_size) {
+    std::vector<uint8_t> key(key_size);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 255);
+    for (size_t i = 0; i < key_size; ++i) {
+        key[i] = static_cast<uint8_t>(dis(gen));
+    }
+    return key;
+}
+
+// Загрузка библиотеки и получение функций
+struct CryptoLib {
+    LIB_HANDLE handle;
+    const AlgorithmInfo* (*get_info)();
+    size_t (*get_output_size)(size_t, int);
+    int (*encrypt)(ConstBuffer, ConstBuffer, MutBuffer*);
+    int (*decrypt)(ConstBuffer, ConstBuffer, MutBuffer*);
+    
+    ~CryptoLib() {
+        if (handle) CLOSE_LIB(handle);
+    }
+};
+
+static CryptoLib load_library(const std::string& algo_name) {
+    CryptoLib lib{};
+    std::string lib_path;
+    
+    for (int i = 0; algorithms[i].name != nullptr; ++i) {
+        if (algorithms[i].name == algo_name) {
+#ifdef _WIN32
+            lib_path = algorithms[i].lib_name_windows;
+#else
+            lib_path = algorithms[i].lib_name_linux;
+#endif
+            break;
+        }
+    }
+    
+    if (lib_path.empty()) {
+        throw std::runtime_error("Unknown algorithm: " + algo_name);
+    }
+    
+    lib.handle = LOAD_LIB(lib_path.c_str());
     if (!lib.handle) {
-        cerr << "Не удалось загрузить " << path;
-#if !defined(_WIN32)
-        cerr << " (" << dlerror() << ")";
-#endif
-        cerr << endl;
-        return false;
+        throw std::runtime_error("Cannot load library: " + lib_path);
     }
-
-    lib.encrypt_text = (TextFunc)GET_FUNC(lib.handle, "encrypt_text");
-    lib.decrypt_text = (TextFunc)GET_FUNC(lib.handle, "decrypt_text");
-    lib.encrypt_file = (FileFunc)GET_FUNC(lib.handle, "encrypt_file");
-    lib.decrypt_file = (FileFunc)GET_FUNC(lib.handle, "decrypt_file");
-    lib.generate_key = (KeyGenFunc)GET_FUNC(lib.handle, "generate_key");
-
-    // Проверка наличия всех обязательных функций
-    if (!lib.encrypt_text || !lib.decrypt_text || !lib.encrypt_file || !lib.decrypt_file || !lib.generate_key) {
-        cerr << "Библиотека " << path << " не содержит всех необходимых функций!" << endl;
-        CLOSE_LIB(lib.handle);
-        lib.handle = nullptr;
-        return false;
+    
+    lib.get_info = reinterpret_cast<decltype(lib.get_info)>(GET_FUNC(lib.handle, "get_algorithm_info"));
+    lib.get_output_size = reinterpret_cast<decltype(lib.get_output_size)>(GET_FUNC(lib.handle, "get_output_size"));
+    lib.encrypt = reinterpret_cast<decltype(lib.encrypt)>(GET_FUNC(lib.handle, "encrypt"));
+    lib.decrypt = reinterpret_cast<decltype(lib.decrypt)>(GET_FUNC(lib.handle, "decrypt"));
+    
+    if (!lib.get_info || !lib.get_output_size || !lib.encrypt || !lib.decrypt) {
+        throw std::runtime_error("Library missing required functions");
     }
-
-    lib.name = fs::path(path).stem().string();
-    return true;
+    
+    return lib;
 }
 
-// Создание директорий для пути (если их нет)
-bool ensure_directories(const string& path) {
-    fs::path p(path);
-    fs::path parent = p.parent_path();
-    if (!parent.empty() && !fs::exists(parent)) {
-        return fs::create_directories(parent);
-    }
-    return true;
-}
-
-// Меню выбора алгоритма
-int select_algorithm(const vector<CryptoLib>& libs) {
-    if (libs.empty()) {
-        cout << "Нет доступных библиотек. Поместите ." << LIB_EXT << " файлы в текущую папку.\n";
-        return -1;
-    }
-    cout << "\nДоступные алгоритмы:\n";
-    for (size_t i = 0; i < libs.size(); ++i) {
-        cout << "  " << i+1 << ". " << libs[i].name << endl;
-    }
-    cout << "Выберите номер (0 - выход): ";
-    int choice;
-    cin >> choice;
-    if (choice == 0) return -1;
-    if (choice < 1 || choice > (int)libs.size()) {
-        cout << "Неверный выбор.\n";
-        return -2;
-    }
-    return choice-1;
-}
-
-// Шифрование/дешифрование текста
-void text_operation(CryptoLib& lib) {
-    cout << "\n--- Работа с текстом ---\n";
-    cout << "1. Шифрование\n2. Дешифрование\nВыбор: ";
-    int mode;
-    cin >> mode;
-    if (mode != 1 && mode != 2) {
-        cout << "Неверный режим.\n";
-        return;
-    }
-    cin.ignore();
-
-    if (mode == 1) {
-        // Шифрование
-        cout << "Введите открытый текст: ";
-        string plaintext;
-        getline(cin, plaintext);
-        cout << "Введите ключ (public_key:prime для Шамира, иначе обычный ключ): ";
-        string key;
-        getline(cin, key);
-        
-        // Для Шамира ключ должен быть в формате "public_key:prime"
-        string plain_hex = bytes_to_hex(plaintext.c_str(), plaintext.length());
-        char output[2048] = {0};
-        lib.encrypt_text(plain_hex.c_str(), key.c_str(), output);
-        cout << "Зашифрованный текст (hex): " << output << endl;
-    } 
-    else {
-        // Дешифрование
-        cout << "Введите зашифрованный текст (в hex): ";
-        string hex_input;
-        getline(cin, hex_input);
-        cout << "Введите ключ (private_key:prime для Шамира, иначе обычный ключ): ";
-        string key;
-        getline(cin, key);
-        
-        char output[4096] = {0};
-        lib.decrypt_text(hex_input.c_str(), key.c_str(), output);
-        
-        vector<unsigned char> dec_bytes = hex_to_bytes(output);
-        string dec_text(dec_bytes.begin(), dec_bytes.end());
-        while (!dec_text.empty() && dec_text.back() == '\0') dec_text.pop_back();
-        cout << "Расшифрованный текст: " << dec_text << endl;
-    }
-}
-
-// Шифрование/дешифрование файла
-void file_operation(CryptoLib& lib) {
-    cout << "\n--- Работа с файлом ---\n";
-    cout << "1. Шифрование\n2. Дешифрование\nВыбор: ";
-    int mode;
-    cin >> mode;
-    if (mode != 1 && mode != 2) {
-        cout << "Неверный режим.\n";
-        return;
-    }
-
-    cin.ignore();
-    cout << "Входной файл: ";
-    string in_path;
-    getline(cin, in_path);
-    cout << "Выходной файл (Enter - создать автоматически): ";
-    string out_path;
-    getline(cin, out_path);
-    if (out_path.empty()) {
-        // автоматическое имя: input.enc / input.dec
-        fs::path p(in_path);
-        string ext = (mode == 1) ? ".enc" : ".dec";
-        out_path = p.string() + ext;
-        cout << "Используется выходной файл: " << out_path << endl;
-    }
-
-    // Проверка существования входного файла
-    if (!fs::exists(in_path)) {
-        cerr << "Ошибка: входной файл не существует.\n";
-        return;
-    }
-
-    // Создание директорий для выходного файла
-    if (!ensure_directories(out_path)) {
-        cerr << "Не удалось создать директории для " << out_path << endl;
-        return;
-    }
-
-    cout << "Введите ключ: ";
-    string key;
-    getline(cin, key);
-
-    bool success = false;
+int main(int argc, char* argv[]) {
     try {
-        if (mode == 1)
-            success = lib.encrypt_file(in_path.c_str(), out_path.c_str(), key.c_str());
-        else
-            success = lib.decrypt_file(in_path.c_str(), out_path.c_str(), key.c_str());
-    } catch (...) {
-        cerr << "Исключение при обработке файла.\n";
-        return;
-    }
-
-    if (success)
-        cout << "Операция успешно завершена. Результат: " << out_path << endl;
-    else
-        cerr << "Ошибка: не удалось выполнить операцию (возможно, проблема с открытием файлов).\n";
-}
-
-// Генерация ключа
-void generate_key(CryptoLib& lib) {
-    char key[256] = {0};
-    lib.generate_key(key);
-    cout << "Сгенерированный ключ: " << key << endl;
-}
-
-int main() {
-    setlocale(LC_ALL, "Russian");
-#if defined(_WIN32)
-    system("chcp 65001 > nul"); // UTF-8 для Windows
-#endif
-
-    cout << "=== Encryption Algorithm RGR ===\n";
-    cout << "Программа для шифрования/дешифрования текста и файлов.\n";
-
-    // Поиск и загрузка библиотек
-    vector<string> lib_paths = find_libraries();
-    if (lib_paths.empty()) {
-        cerr << "Не найдено ни одной динамической библиотеки (" << LIB_EXT << ").\n";
-        cerr << "Поместите скомпилированные библиотеки (vigenere" << LIB_EXT << ", des" << LIB_EXT << ") в текущую папку.\n";
+        Options opts = parse_args(argc, argv);
+        
+        // Режим справки
+        if (opts.help || argc == 1) {
+            print_help(argv[0]);
+            return 0;
+        }
+        
+        // Проверка обязательных параметров
+        if (opts.algorithm.empty()) {
+            std::cerr << "Error: --algorithm is required\n";
+            print_help(argv[0]);
+            return 1;
+        }
+        
+        if (opts.mode.empty()) {
+            std::cerr << "Error: --mode is required (encrypt, decrypt, generate-key)\n";
+            return 1;
+        }
+        
+        // Загрузка библиотеки
+        CryptoLib lib = load_library(opts.algorithm);
+        const AlgorithmInfo* info = lib.get_info();
+        
+        // Режим генерации ключа
+        if (opts.mode == "generate-key") {
+            if (!opts.generate_key) {
+                std::cerr << "Error: --generate-key required for generate-key mode\n";
+                return 1;
+            }
+            
+            std::vector<uint8_t> key = generate_random_key(info->key_size);
+            
+            if (!opts.save_key_path.empty()) {
+                write_file(opts.save_key_path, key.data(), key.size());
+                std::cerr << "Key saved to: " << opts.save_key_path << "\n";
+            }
+            
+            if (opts.write_key) {
+                write_stdout(key.data(), key.size());
+            }
+            
+            secure_zero(key.data(), key.size());
+            return 0;
+        }
+        
+        // Режим шифрования/дешифрования
+        if (opts.mode != "encrypt" && opts.mode != "decrypt") {
+            std::cerr << "Error: invalid mode. Use: encrypt, decrypt, generate-key\n";
+            return 1;
+        }
+        
+        // Загрузка ключа
+        std::vector<uint8_t> key;
+        if (!opts.key_path.empty()) {
+            key = read_file(opts.key_path);
+        } else if (opts.generate_key) {
+            key = generate_random_key(info->key_size);
+            if (opts.write_key) {
+                write_stdout(key.data(), key.size());
+                std::cerr << "\n[Key written to stdout]\n";
+            }
+            if (!opts.save_key_path.empty()) {
+                write_file(opts.save_key_path, key.data(), key.size());
+                std::cerr << "Key saved to: " << opts.save_key_path << "\n";
+            }
+        } else {
+            std::cerr << "Error: --key or --generate-key required\n";
+            return 1;
+        }
+        
+        if (key.size() != info->key_size) {
+            std::cerr << "Error: key size mismatch. Expected " << info->key_size 
+                      << " bytes, got " << key.size() << "\n";
+            return 1;
+        }
+        
+        // Загрузка входных данных
+        std::vector<uint8_t> input;
+        if (!opts.input_path.empty()) {
+            input = read_file(opts.input_path);
+        } else {
+            input = read_stdin();
+        }
+        
+        // Вычисление размера выходного буфера
+        int op_type = (opts.mode == "encrypt") ? 1 : 0;
+        size_t out_size = lib.get_output_size(input.size(), op_type);
+        std::vector<uint8_t> output(out_size);
+        
+        // Выполнение операции
+        ConstBuffer key_buf{key.data(), key.size()};
+        ConstBuffer input_buf{input.data(), input.size()};
+        MutBuffer output_buf{output.data(), output.size()};
+        
+        int result;
+        if (opts.mode == "encrypt") {
+            result = lib.encrypt(key_buf, input_buf, &output_buf);
+        } else {
+            result = lib.decrypt(key_buf, input_buf, &output_buf);
+        }
+        
+        if (result != CRYPTO_SUCCESS) {
+            std::cerr << "Error: cryptographic operation failed with code " << result << "\n";
+            return 1;
+        }
+        
+        // Запись выходных данных
+        if (!opts.output_path.empty()) {
+            write_file(opts.output_path, output_buf.data, output_buf.size);
+        } else {
+            write_stdout(output_buf.data, output_buf.size);
+        }
+        
+        // Очистка чувствительных данных
+        secure_zero(key.data(), key.size());
+        secure_zero(input.data(), input.size());
+        secure_zero(output.data(), output.size());
+        
+        return 0;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << "\n";
         return 1;
     }
-
-    vector<CryptoLib> libs;
-    for (const auto& path : lib_paths) {
-        CryptoLib lib;
-        if (load_library(path, lib)) {
-            libs.push_back(lib);
-            cout << "Загружена библиотека: " << lib.name << endl;
-        }
-    }
-
-    if (libs.empty()) {
-        cerr << "Не удалось загрузить ни одной корректной библиотеки.\n";
-        return 1;
-    }
-
-    int alg_idx = -1;
-    while (alg_idx == -1) {
-        alg_idx = select_algorithm(libs);
-        if (alg_idx == -1) return 0;
-        if (alg_idx == -2) alg_idx = -1;
-    }
-
-    CryptoLib& active_lib = libs[alg_idx];
-    cout << "\nВыбран алгоритм: " << active_lib.name << endl;
-
-    bool exit_flag = false;
-    while (!exit_flag) {
-        cout << "\n--- Главное меню ---\n";
-        cout << "1. Шифрование/дешифрование текста\n";
-        cout << "2. Шифрование/дешифрование файла\n";
-        cout << "3. Сгенерировать ключ\n";
-        cout << "0. Выход\n";
-        cout << "Выбор: ";
-        int choice;
-        cin >> choice;
-        cin.ignore();
-
-        switch (choice) {
-            case 1:
-                text_operation(active_lib);
-                break;
-            case 2:
-                file_operation(active_lib);
-                break;
-            case 3:
-                generate_key(active_lib);
-                break;
-            case 0:
-                exit_flag = true;
-                break;
-            default:
-                cout << "Неверный выбор. Попробуйте снова.\n";
-        }
-    }
-
-    // Выгрузка библиотек
-    for (auto& lib : libs) {
-        if (lib.handle) CLOSE_LIB(lib.handle);
-    }
-    cout << "Программа завершена.\n";
-    return 0;
 }

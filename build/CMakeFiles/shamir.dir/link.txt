@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC  -Wall -Wextra -Werror -shared -Wl,-soname,libshamir.so -o libshamir.so CMakeFiles/shamir.dir/shamir.cpp.o 
