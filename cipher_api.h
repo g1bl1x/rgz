@@ -4,10 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__WIN32__) || defined(WIN32)
     #define EXPORT_API extern "C" __declspec(dllexport)
 #else
-    #define EXPORT_API extern "C"
+    #define EXPORT_API extern "C" __attribute__((visibility("default")))
 #endif
 
 // Структуры для безопасной передачи данных
