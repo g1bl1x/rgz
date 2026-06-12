@@ -149,7 +149,7 @@ int select_algorithm(const vector<CryptoLib>& libs) {
     if (choice == 0) return -1;
     if (choice < 1 || choice > (int)libs.size()) {
         cout << "Неверный выбор.\n";
-        return -2; // повтор
+        return -2;
     }
     return choice-1;
 }
@@ -171,11 +171,11 @@ void text_operation(CryptoLib& lib) {
         cout << "Введите открытый текст: ";
         string plaintext;
         getline(cin, plaintext);
-        cout << "Введите ключ: ";
+        cout << "Введите ключ (public_key:prime для Шамира, иначе обычный ключ): ";
         string key;
         getline(cin, key);
-
-        // Преобразуем открытый текст в hex
+        
+        // Для Шамира ключ должен быть в формате "public_key:prime"
         string plain_hex = bytes_to_hex(plaintext.c_str(), plaintext.length());
         char output[2048] = {0};
         lib.encrypt_text(plain_hex.c_str(), key.c_str(), output);
@@ -186,17 +186,15 @@ void text_operation(CryptoLib& lib) {
         cout << "Введите зашифрованный текст (в hex): ";
         string hex_input;
         getline(cin, hex_input);
-        cout << "Введите ключ: ";
+        cout << "Введите ключ (private_key:prime для Шамира, иначе обычный ключ): ";
         string key;
         getline(cin, key);
-
+        
         char output[4096] = {0};
         lib.decrypt_text(hex_input.c_str(), key.c_str(), output);
         
-        // Превращаем обратно в текст.
         vector<unsigned char> dec_bytes = hex_to_bytes(output);
         string dec_text(dec_bytes.begin(), dec_bytes.end());
-        // Убираем возможные нулевые символы в конце
         while (!dec_text.empty() && dec_text.back() == '\0') dec_text.pop_back();
         cout << "Расшифрованный текст: " << dec_text << endl;
     }
@@ -319,7 +317,7 @@ int main() {
         cout << "Выбор: ";
         int choice;
         cin >> choice;
-        cin.ignore(); // очистка буфера
+        cin.ignore();
 
         switch (choice) {
             case 1:
